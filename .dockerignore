@@ -1,0 +1,14 @@
+node_modules
+**/node_modules
+dist
+**/dist
+.env
+.env.*
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+apps/api/data
+apps/worker/data/outbox
+.git
+PLAN.md

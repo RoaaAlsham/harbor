@@ -3,7 +3,7 @@ import { registerHealthRoutes } from "./health.js";
 import { registerProductRoutes } from "./products.js";
 import "./db.js";
 
-const port = Number(process.env.HARBOR_PORT ?? 8788);
+const port = Number(process.env.PORT ?? process.env.HARBOR_PORT ?? 8788);
 
 const app = Fastify({ logger: true });
 
@@ -13,7 +13,7 @@ app.register(async (instance) => {
 });
 
 app
-  .listen({ port, host: "127.0.0.1" })
+  .listen({ port, host: "0.0.0.0" })
   .catch((err) => {
     app.log.error(err);
     process.exit(1);
