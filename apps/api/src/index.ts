@@ -1,3 +1,4 @@
+import "./env.js";
 import Fastify from "fastify";
 import { registerHealthRoutes } from "./health.js";
 import { registerProductRoutes } from "./products.js";

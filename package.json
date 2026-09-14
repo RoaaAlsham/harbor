@@ -9,6 +9,6 @@
   "scripts": {
     "dev:api": "npm run dev --workspace apps/api",
     "seed": "node scripts/seed.mjs",
-    "digest": "npm run start --workspace apps/worker"
+    "digest": "npm run start --workspace apps/worker --"
   }
 }

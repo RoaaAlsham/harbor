@@ -1,3 +1,4 @@
+import "./env.js";
 import { fetchProducts } from "./harborClient.js";
 import { findLowStock } from "./digest.js";
 import { sendDigestEmail } from "./mailer.js";
@@ -18,5 +19,8 @@ async function main() {
 
 main().catch((err) => {
   console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
+  // exitCode, not exit(1): forcing an immediate exit here races fetch's
+  // internal handle cleanup and crashes with an assertion failure on
+  // Windows. Setting exitCode lets Node exit 1 once the loop drains.
+  process.exitCode = 1;
 });

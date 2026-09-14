@@ -37,7 +37,8 @@ identity ever reaches Harbor):
 |---|---|
 | [apps/api/src/auth.ts](apps/api/src/auth.ts) | `requireApiKey` (`X-Harbor-Key` check, with a gateway-signature fallback) replaced entirely by `requireGatewaySignature`. No fallback, no legacy key — gateway signature verification is the only auth path. Logs one line per authenticated request (`auth_type`, `api_key_type`, `user_id_present`) and calls out a warning if `X-AuthDeep-User-ID` is ever present, since Path C must never carry one. |
 | [apps/api/src/products.ts](apps/api/src/products.ts) | Hook updated to `requireGatewaySignature`. |
-| [apps/api/src/index.ts](apps/api/src/index.ts) | Unchanged from the earlier gateway work — still captures `request.rawBody` (the HMAC signs raw bytes, not re-serialized JSON). |
+| [apps/api/src/index.ts](apps/api/src/index.ts) | Still captures `request.rawBody` (the HMAC signs raw bytes, not re-serialized JSON). Now also `import "./env.js"` as the very first line — see below. |
+| [apps/api/src/env.ts](apps/api/src/env.ts) | **New.** Loads the repo-root `.env` into `process.env` for local dev — see "The `.env` file was never actually loaded" below. |
 
 `HARBOR_API_KEY` no longer exists anywhere in the codebase.
 
@@ -47,12 +48,70 @@ identity ever reaches Harbor):
 |---|---|
 | [apps/worker/src/harborClient.ts](apps/worker/src/harborClient.ts) | Rewritten. No more direct `fetch(HARBOR_API_URL, { headers: { X-Harbor-Key } })`. Now exports `signedFetch(method, path, body?)` — signs and sends any AuthDeep request (skill §1 outbound HMAC recipe) — and `fetchProducts()`, which calls `signedFetch("GET", "/api/gateway/proxy/harbor-api/products")`. |
 | [apps/worker/src/mailer.ts](apps/worker/src/mailer.ts) | Rewritten. No more `writeDigestEmail()` writing to `apps/worker/data/outbox/`. Now `buildDigestEmail()` builds the AuthDeep payload shape (`to`/`subject`/`html_body`/`text_body`), and `sendDigestEmail(lowStock, { dryRun })` posts it via `signedFetch` to `/api/gateway/notifications/email`, expecting `202 { accepted: true }`. `dryRun` short-circuits before the network call and just prints the payload — it needs `AUTHDEEP_DIGEST_TO` but *not* AuthDeep credentials, so it works for local debugging without secrets. |
-| [apps/worker/src/run.ts](apps/worker/src/run.ts) | Reads `--dry-run` off `process.argv`, still fetches real products either way (dry-run only skips the send), prints `digest sent` / `dry run — not sent`. |
+| [apps/worker/src/run.ts](apps/worker/src/run.ts) | Reads `--dry-run` off `process.argv`, still fetches real products either way (dry-run only skips the send), prints `digest sent` / `dry run — not sent`. Now `import "./env.js"` first (see below). Exit-on-error changed from `process.exit(1)` to `process.exitCode = 1` — see "Windows crash on exit" below. |
 | [apps/worker/src/digest.ts](apps/worker/src/digest.ts) | Unchanged — `findLowStock` didn't need to change. |
+| [apps/worker/src/env.ts](apps/worker/src/env.ts) | **New.** Same `.env` loader as the API's, independently duplicated (no shared package between the two workspaces). |
 
 The worker now depends on AuthDeep being reachable even to read product
 data — that's the tradeoff of Path C (see PLAN.md's own framing: "that swap
 is fake" if Phase 1 wasn't already key-based S2S).
+
+### Two bugs found running this for real (2026-09-14)
+
+**The `.env` file was never actually loaded.** Nothing in this project —
+not before Phase 2, not after — ever read `.env` into `process.env`. Every
+verification in this manual up to this point had worked around that by
+passing vars inline on the command line, which masked the gap. The first
+real attempt to just edit `.env` and run `npm run digest` failed with
+`AUTHDEEP_BASE_URL, AUTHDEEP_SERVICE_KEY and AUTHDEEP_HMAC_SECRET must all
+be set` despite `.env` being filled in correctly.
+
+Fixed with `env.ts` in each workspace: a small loader (no `dotenv`
+dependency) that reads the repo-root `.env` and fills in any `process.env`
+key not already set, skipping silently if the file doesn't exist. It's
+imported as the **literal first line** of `index.ts`/`run.ts` — this
+matters: ES module evaluation order means an entry file's own top-level
+code (even code textually placed above its `import` statements) always runs
+*after* all its statically imported dependencies have evaluated, not
+before. `auth.ts`/`harborClient.ts`/`mailer.ts` read their env vars into
+module-scope `const`s at import time, so the loader has to be a *separate
+imported module*, and it has to be the first import in the file, so it
+evaluates before any sibling import that depends on those env vars. Inline
+code at the top of `index.ts` would have been too late.
+
+In production this is a no-op by design: Render injects real env vars
+directly, no `.env` file exists in the deployed container (excluded via
+`.dockerignore`), `existsSync` returns `false`, nothing happens.
+
+**`npm run digest --dry-run` silently dropped the flag.** Without a `--`
+separator, npm treats `--dry-run` as its own recognized CLI flag rather
+than forwarding it to the script. Worse, the root `digest` script is itself
+a wrapper (`npm run start --workspace apps/worker`) — a second layer of the
+same problem, since args appended after one `--` don't automatically get a
+second `--` inserted for the inner `npm run` to forward them again. Fixed
+by ending the root script with a dangling `--`
+(`"digest": "npm run start --workspace apps/worker --"` in
+[package.json](package.json)): npm appends any trailing CLI args directly
+onto that string, so `npm run digest -- --dry-run` becomes
+`npm run start --workspace apps/worker -- --dry-run` — now correctly
+`--`-separated for the inner `npm run` to forward to `tsx src/run.ts`.
+
+Use `npm run digest -- --dry-run` (the `--` is required) or
+`npm run digest` for a real send.
+
+### Windows crash on exit
+
+A third issue surfaced while testing the fixes above: on a real
+authentication failure (see below), the worker printed the right error
+message and then crashed with
+`Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c`
+instead of exiting cleanly. This is a Windows-specific Node/libuv race:
+calling `process.exit()` immediately after a `fetch()` completes can kill
+the process while `fetch`'s internal connection-cleanup handles are still
+closing. Fixed by setting `process.exitCode = 1` instead of calling
+`process.exit(1)` in `run.ts` — Node exits with that code once the event
+loop drains naturally, no race. Confirmed fixed: same failing scenario now
+exits cleanly with code `1`, no crash.
 
 ## Env vars
 
@@ -76,11 +135,12 @@ All placeholders live in [.env.example](.env.example).
 1. **Local `.env`** (gitignored — [.gitignore](.gitignore)): fill in real
    values from `.env.example`'s placeholders.
 2. **Wherever each half runs in production** — for the API that's the
-   Render dashboard's Environment tab (`AUTHDEEP_GATEWAY_KEY` +
-   `AUTHDEEP_SERVICE_SECRET`, already set there as of this integration). For
-   the worker, wherever it's actually invoked from (a scheduled job, a
-   second Render service, a cron host) — set all four worker vars there.
-   Never in the `Dockerfile` or any committed file.
+   Render dashboard's Environment tab, on the `harbor-api` **web service**
+   (`AUTHDEEP_GATEWAY_KEY` + `AUTHDEEP_SERVICE_SECRET`, already set there as
+   of this integration). For the worker, **local `.env` only, for now** —
+   see "Still to do" item 4. Never in the `Dockerfile` or any committed
+   file, and never the API's four worker-only vars on the API's own Render
+   service — that service only runs `apps/api`, which doesn't read them.
 
 If you have a new secret to hand over, put it directly into one of those two
 places yourself — don't paste it into this chat.
@@ -212,27 +272,103 @@ prove AuthDeep's admin-side config (service registration, `sak_`
 permissions, tenant SMTP) is correct — only a real Tier 2 run against the
 actual tenant proves that.
 
+**A real Tier 2 run against the live tenant (2026-09-14, after the two bugs
+above were fixed) got exactly that:**
+
+```
+npm run digest -- --dry-run
+→ GET /products failed: 403 Forbidden
+```
+
+`403`, not `401` — the signature was accepted (real authentication
+succeeded, both bugs above are genuinely fixed), but the `harbor-worker`
+`sak_` isn't authorized to call the `harbor-api` service. This is "Still to
+do" item 2 below, not a code problem: the API key needs the
+`{ serviceId: harbor-api, httpMethod: "*" }` permission attached to it in
+AuthDeep admin. The API side is independently confirmed correct too — a
+Tier 1 request using the real `gwk_`/`ssk_` from `.env` (the same values
+set on Render) got `200` with the full product list.
+
+### Full pipeline confirmed end-to-end (2026-09-14)
+
+After attaching `{ serviceId: harbor-api, httpMethod: "*" }` to the
+`harbor-worker` `sak_` in AuthDeep admin:
+
+```
+PS> npm run digest
+
+> harbor@1.0.0 digest
+> npm run start --workspace apps/worker --
+
+> @harbor/worker@1.0.0 start
+> tsx src/run.ts
+
+digest sent
+```
+
+`digest sent` (not `--dry-run`) means every hop of the real chain worked in
+one run:
+
+1. Worker signs `GET /api/gateway/proxy/harbor-api/products` with the
+   `harbor-worker` `sak_` + HMAC.
+2. AuthDeep verifies the signature **and now authorizes it** (the fix).
+3. AuthDeep proxies to Harbor's registered `backendUrl` (Render), signing
+   with `ssk_` — this also retroactively confirms "still to do" item 1
+   below (the service's `backendUrl`/`healthPath` config): a fake or wrong
+   `backendUrl` would have failed here, not returned real product data.
+4. Harbor's API verifies that signature (`requireGatewaySignature`) and
+   returns the real product list.
+5. Worker filters low stock, builds the email, signs
+   `POST /api/gateway/notifications/email` with the same `sak_`.
+6. AuthDeep accepts it — `202 { accepted: true }` — worker prints
+   `digest sent`.
+
+Note this was run alongside `npm run dev:api` (a local copy of the API on
+`127.0.0.1:8788`) in the same terminal — that's unrelated and wasn't
+needed: the worker only ever talks to AuthDeep, which proxies to the
+**Render** `backendUrl`, never to `localhost`. `202` only proves AuthDeep
+*accepted* the email for delivery, not that it *arrived* — check the
+`AUTHDEEP_DIGEST_TO` inbox to confirm actual delivery, which depends on
+"still to do" item 3 (tenant SMTP) below.
+
+### PLAN.md Phase 2 acceptance — status
+
+| Criterion | Status |
+|---|---|
+| `npm run digest` produces a low-stock email (AuthDeep `202`, not an outbox file) | ✅ confirmed above |
+| List works only through the gateway with `sak_` + HMAC | ✅ confirmed (`GET /products` above) |
+| Adjust works only through the gateway with `sak_` + HMAC | Same code path as list (`requireGatewaySignature` covers all product routes uniformly) — not separately exercised with real credentials this session |
+| Direct curl with old `X-Harbor-Key` fails | ✅ confirmed (`401`) |
+| Direct curl with no gateway headers fails | ✅ confirmed (`401`) |
+| API logs `auth_type: api_key` and no `X-AuthDeep-User-ID` | ✅ confirmed locally with test credentials (see logging section above) — not yet checked directly in Render's live logs for this real run |
+| Worker has no user password, no browser code | ✅ trivially true, no such code exists |
+| Email actually delivered (not just accepted) | **Unconfirmed** — check the `AUTHDEEP_DIGEST_TO` inbox |
+
 ## Still to do (in AuthDeep, not this repo)
 
-1. **Confirm the registered service config**: `backendUrl =
-   https://harbor-6jd6.onrender.com`, `healthPath = /health`.
-2. **Mint the `sak_`** with both permissions (PLAN.md Phase 2):
-   ```json
-   { "permissions": [
-     { "serviceId": "<harbor-api service id>", "httpMethod": "*" },
-     { "capability": "notifications_email", "httpMethod": "POST" }
-   ] }
-   ```
-   Store the resulting `sak_` + HMAC secret as `AUTHDEEP_SERVICE_KEY` /
-   `AUTHDEEP_HMAC_SECRET` wherever the worker runs.
+1. ~~**Confirm the registered service config**~~ — done; the real product
+   data returned in the pipeline run above proves `backendUrl`/`healthPath`
+   are correctly pointed at the Render deployment.
+2. ~~**Mint the `sak_`** with the `harbor-api` service permission~~ — done
+   (2026-09-14); `harbor-worker` now authorizes correctly. Still worth
+   double-checking the `notifications_email` capability permission is also
+   attached (it must be, since the send in the pipeline run above also
+   succeeded) — if a future `sak_` rotation only copies one of the two
+   permissions, sends would start failing with the same `403` pattern seen
+   above.
 3. **Configure tenant notification delivery** (`provider: smtp` + real SMTP
    fields, or `authdeep_mail`) via `PUT /api/gateway/notifications/settings`
-   — without it, sends may `202` but never actually deliver. PLAN.md prefers
-   real SMTP so Phase 2 mail is real, not just accepted.
-4. **Decide where the worker actually runs** and set its four env vars
-   there (a scheduled job, a second Render service, wherever `npm run
-   digest` gets invoked on a schedule) — it isn't deployed anywhere yet,
-   it's still a CLI you run by hand.
+   — without it, sends may `202` but never actually deliver. **Check the
+   `AUTHDEEP_DIGEST_TO` inbox** to find out which state you're in.
+4. **Where the worker runs: local, for now (decided 2026-09-14).** It's a
+   one-shot CLI, not a web service — it can't go on the `harbor-api` Render
+   service (a real mistake made and caught during this integration: its
+   four vars were briefly added there by accident, where the API code never
+   reads them). Its four vars belong in local `.env` only, and you run
+   `npm run digest` / `npm run digest -- --dry-run` by hand. If this later
+   needs to run on a schedule, that's a **Render Cron Job** — a separate
+   resource from the `harbor-api` web service, since Cron Jobs run a
+   command to completion rather than listening on a port. Revisit then.
 
 ## Troubleshooting
 
