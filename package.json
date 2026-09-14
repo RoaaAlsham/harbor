@@ -1,0 +1,14 @@
+{
+  "name": "harbor",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/api",
+    "apps/worker"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace apps/api",
+    "seed": "node scripts/seed.mjs",
+    "digest": "npm run start --workspace apps/worker"
+  }
+}
