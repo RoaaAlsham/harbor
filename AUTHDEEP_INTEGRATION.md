@@ -326,10 +326,12 @@ one run:
 Note this was run alongside `npm run dev:api` (a local copy of the API on
 `127.0.0.1:8788`) in the same terminal — that's unrelated and wasn't
 needed: the worker only ever talks to AuthDeep, which proxies to the
-**Render** `backendUrl`, never to `localhost`. `202` only proves AuthDeep
-*accepted* the email for delivery, not that it *arrived* — check the
-`AUTHDEEP_DIGEST_TO` inbox to confirm actual delivery, which depends on
-"still to do" item 3 (tenant SMTP) below.
+**Render** `backendUrl`, never to `localhost`.
+
+**Delivery confirmed (2026-09-14):** the digest email actually arrived at
+the `AUTHDEEP_DIGEST_TO` inbox — not just `202`-accepted. Tenant
+notification delivery (item 3 below) is correctly configured; this is a
+real, complete send, not just a queued-and-dropped one.
 
 ### PLAN.md Phase 2 acceptance — status
 
@@ -342,7 +344,7 @@ needed: the worker only ever talks to AuthDeep, which proxies to the
 | Direct curl with no gateway headers fails | ✅ confirmed (`401`) |
 | API logs `auth_type: api_key` and no `X-AuthDeep-User-ID` | ✅ confirmed locally with test credentials (see logging section above) — not yet checked directly in Render's live logs for this real run |
 | Worker has no user password, no browser code | ✅ trivially true, no such code exists |
-| Email actually delivered (not just accepted) | **Unconfirmed** — check the `AUTHDEEP_DIGEST_TO` inbox |
+| Email actually delivered (not just accepted) | ✅ confirmed — arrived in the `AUTHDEEP_DIGEST_TO` inbox |
 
 ## Still to do (in AuthDeep, not this repo)
 
@@ -356,10 +358,12 @@ needed: the worker only ever talks to AuthDeep, which proxies to the
    succeeded) — if a future `sak_` rotation only copies one of the two
    permissions, sends would start failing with the same `403` pattern seen
    above.
-3. **Configure tenant notification delivery** (`provider: smtp` + real SMTP
-   fields, or `authdeep_mail`) via `PUT /api/gateway/notifications/settings`
-   — without it, sends may `202` but never actually deliver. **Check the
-   `AUTHDEEP_DIGEST_TO` inbox** to find out which state you're in.
+3. ~~**Configure tenant notification delivery**~~ — done; confirmed
+   2026-09-14 by an actual email arriving at the `AUTHDEEP_DIGEST_TO`
+   inbox, not just a `202` response. (Which provider is configured —
+   tenant SMTP vs `authdeep_mail` — isn't visible from this repo; check
+   AuthDeep admin's Notification Email settings if that detail matters
+   later.)
 4. **Where the worker runs: local, for now (decided 2026-09-14).** It's a
    one-shot CLI, not a web service — it can't go on the `harbor-api` Render
    service (a real mistake made and caught during this integration: its
@@ -369,6 +373,16 @@ needed: the worker only ever talks to AuthDeep, which proxies to the
    needs to run on a schedule, that's a **Render Cron Job** — a separate
    resource from the `harbor-api` web service, since Cron Jobs run a
    command to completion rather than listening on a port. Revisit then.
+
+**Status: integration complete (2026-09-14).** Every blocking item above is
+done, and the full pipeline is confirmed working end to end with a real
+delivered email, not just a queued `202`. What's left is optional
+spot-checking, not open work: the `adjust` route hasn't been separately
+exercised with real credentials (it shares the exact same
+`requireGatewaySignature` code path as the confirmed `list` route, so this
+is low-risk), and the required per-request log line hasn't been eyeballed
+directly in Render's live logs (confirmed locally with test credentials
+instead). Neither blocks calling this done.
 
 ## Troubleshooting
 
