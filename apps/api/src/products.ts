@@ -18,7 +18,9 @@ const adjustStmt = db.prepare<[number, string, string], void>(
 );
 
 export function registerProductRoutes(app: FastifyInstance) {
-  app.addHook("onRequest", requireApiKey);
+  // preHandler, not onRequest: gateway signature verification needs the
+  // parsed request body (see rawBody capture in index.ts).
+  app.addHook("preHandler", requireApiKey);
 
   app.get("/products", async () => {
     return { products: listStmt.all() };

@@ -88,6 +88,12 @@ npm run digest
 `apps/worker/src/harborClient.ts` is the only module that knows the API
 URL and key.
 
+## AuthDeep gateway
+
+The API also accepts requests proxied through an AuthDeep API gateway
+(`/api/gateway/proxy/harbor-api/...`), verifying the gateway's signature
+instead of `X-Harbor-Key`. See [AUTHDEEP_INTEGRATION.md](AUTHDEEP_INTEGRATION.md).
+
 ## Project layout
 
 ```
