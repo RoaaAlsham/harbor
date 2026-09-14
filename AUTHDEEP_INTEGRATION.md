@@ -1,163 +1,158 @@
 # AuthDeep gateway integration
 
-How Harbor's API is wired up to sit behind an AuthDeep API gateway, and how
-to operate it going forward. Written as the "what we did and why" record —
-read it before touching gateway auth again.
+How Harbor is wired up to AuthDeep, and how to operate it going forward.
+Written as the "what we did and why" record — read it before touching
+gateway auth again. This is **Phase 2** of [PLAN.md](PLAN.md) (AuthDeep Path
+C), applied in full: `X-Harbor-Key` is gone, the worker no longer writes
+outbox files.
 
 ## What this integration is
 
-Harbor's API (`apps/api`) is registered with AuthDeep as gateway service
-**`harbor-api`**. External callers hit AuthDeep at:
+Two independent pieces, both **Path C** (`sak_`/`cak_` + HMAC — no human
+identity ever reaches Harbor):
 
-```
-<your-authdeep-base-url>/api/gateway/proxy/harbor-api/<harbor-path>
-```
-
-e.g. `.../api/gateway/proxy/harbor-api/products`. AuthDeep authenticates the
-caller (their session, or a `sak_`/`cak_` API key), then forwards the request
-to Harbor's registered `backendUrl` (the Render URL,
-`https://harbor-6jd6.onrender.com`), signing the hop with the service's
-`ssk_` secret and injecting trusted identity headers.
-
-This is the **"Connect backend → gateway (verify inbound)"** pattern from the
-gateway-integration skill's decision matrix: Harbor's job is to verify
-`X-Gateway-Signature` on every inbound request and reject anything that isn't
-genuinely from AuthDeep. Harbor does not call AuthDeep itself — it's a
-proxied backend, not a client.
-
-## What was already done (outside this repo)
-
-Someone registered the service in AuthDeep admin
-(`POST /api/gateway/services`), which is how these two values were minted:
-
-| Value | What it is | Given to this integration |
-|---|---|---|
-| `gwk_7d1f8763...` | Gateway identity key — identifies inbound requests as coming from *this* registered service | Yes, in chat |
-| `ssk_...` | Service secret key — signs every gateway→backend hop | Not yet — see below |
-
-## Where the keys go — do not paste the `ssk_` into this chat
-
-The gateway key and secret are config, not code. They must never be
-committed or hardcoded. Two places only:
-
-1. **Local `.env`** (already gitignored — see [.gitignore](.gitignore)):
-   ```
-   AUTHDEEP_GATEWAY_KEY=gwk_7d1f876385a4e9e44aa7b1a817428c6fb6703b693a388f5120ea4c5efe000442
-   AUTHDEEP_SERVICE_SECRET=ssk_<paste the real value here yourself>
-   ```
-2. **Render dashboard** → harbor-api service → **Environment** → add both as
-   environment variables (mark `AUTHDEEP_SERVICE_SECRET` as a secret if
-   Render's UI offers that). Do **not** put either in the `Dockerfile` or any
-   committed file.
-
-Placeholders for both were added to [.env.example](.env.example) so the shape
-is documented without real values ever touching git.
-
-If `AUTHDEEP_SERVICE_SECRET` (or `AUTHDEEP_GATEWAY_KEY`) is unset, gateway
-requests get `500 { "error": "gateway not configured" }` — Harbor refuses to
-half-verify.
+1. **API verifies inbound gateway requests.** Harbor's API (`apps/api`) is
+   registered with AuthDeep as gateway service **`harbor-api`**. External
+   callers hit AuthDeep at
+   `<authdeep-base>/api/gateway/proxy/harbor-api/<path>`; AuthDeep
+   authenticates the caller, then forwards to Harbor's `backendUrl` (the
+   Render deployment), signing the hop with the service's `ssk_`. Harbor's
+   job is to verify that signature and reject anything not genuinely from
+   AuthDeep — the skill's **"Connect backend → gateway (verify inbound)"**
+   pattern.
+2. **Worker calls out through AuthDeep, both for data and mail.** The digest
+   worker no longer talks to Harbor's API directly, and no longer writes
+   `.html` files to an outbox. It reads products via the same
+   `/api/gateway/proxy/harbor-api/...` route (as a `sak_`-authenticated
+   caller) and sends the digest via `POST /api/gateway/notifications/email`
+   — the skill's **"App backend → send via tenant SMTP"** recipe. One `sak_`
+   covers both, since PLAN.md's service key is minted with permissions for
+   both the `harbor-api` service and the `notifications_email` capability.
 
 ## What changed in the code
 
+### API (`apps/api`)
+
 | File | Change |
 |---|---|
-| [apps/api/src/auth.ts](apps/api/src/auth.ts) | `requireApiKey` now branches: if `X-Gateway-Key` is present, verify the AuthDeep gateway signature (`verifyGatewaySignature`); otherwise fall back to the existing `X-Harbor-Key` check. |
-| [apps/api/src/index.ts](apps/api/src/index.ts) | Added a custom `application/json` content-type parser that captures the exact raw request body (`request.rawBody`) alongside the parsed JSON — needed because the HMAC signs the raw bytes, not a re-serialized object. |
-| [apps/api/src/products.ts](apps/api/src/products.ts) | Auth hook moved from `onRequest` to `preHandler`, since `rawBody`/`body` aren't populated until the body has been parsed. |
+| [apps/api/src/auth.ts](apps/api/src/auth.ts) | `requireApiKey` (`X-Harbor-Key` check, with a gateway-signature fallback) replaced entirely by `requireGatewaySignature`. No fallback, no legacy key — gateway signature verification is the only auth path. Logs one line per authenticated request (`auth_type`, `api_key_type`, `user_id_present`) and calls out a warning if `X-AuthDeep-User-ID` is ever present, since Path C must never carry one. |
+| [apps/api/src/products.ts](apps/api/src/products.ts) | Hook updated to `requireGatewaySignature`. |
+| [apps/api/src/index.ts](apps/api/src/index.ts) | Unchanged from the earlier gateway work — still captures `request.rawBody` (the HMAC signs raw bytes, not re-serialized JSON). |
 
-Both auth paths stay live on purpose: the worker
-([apps/worker/src/harborClient.ts](apps/worker/src/harborClient.ts)) calls
-Harbor directly with `X-Harbor-Key` and never goes through AuthDeep, so that
-path can't be removed.
+`HARBOR_API_KEY` no longer exists anywhere in the codebase.
 
-### How the signature is verified
+### Worker (`apps/worker`)
 
-Per the skill's inbound-verification contract (§9):
+| File | Change |
+|---|---|
+| [apps/worker/src/harborClient.ts](apps/worker/src/harborClient.ts) | Rewritten. No more direct `fetch(HARBOR_API_URL, { headers: { X-Harbor-Key } })`. Now exports `signedFetch(method, path, body?)` — signs and sends any AuthDeep request (skill §1 outbound HMAC recipe) — and `fetchProducts()`, which calls `signedFetch("GET", "/api/gateway/proxy/harbor-api/products")`. |
+| [apps/worker/src/mailer.ts](apps/worker/src/mailer.ts) | Rewritten. No more `writeDigestEmail()` writing to `apps/worker/data/outbox/`. Now `buildDigestEmail()` builds the AuthDeep payload shape (`to`/`subject`/`html_body`/`text_body`), and `sendDigestEmail(lowStock, { dryRun })` posts it via `signedFetch` to `/api/gateway/notifications/email`, expecting `202 { accepted: true }`. `dryRun` short-circuits before the network call and just prints the payload — it needs `AUTHDEEP_DIGEST_TO` but *not* AuthDeep credentials, so it works for local debugging without secrets. |
+| [apps/worker/src/run.ts](apps/worker/src/run.ts) | Reads `--dry-run` off `process.argv`, still fetches real products either way (dry-run only skips the send), prints `digest sent` / `dry run — not sent`. |
+| [apps/worker/src/digest.ts](apps/worker/src/digest.ts) | Unchanged — `findLowStock` didn't need to change. |
+
+The worker now depends on AuthDeep being reachable even to read product
+data — that's the tradeoff of Path C (see PLAN.md's own framing: "that swap
+is fake" if Phase 1 wasn't already key-based S2S).
+
+## Env vars
+
+Two independent credential sets — the API verifies inbound, the worker
+signs outbound. Neither side needs the other's secret.
+
+| Var | Used by | What it is |
+|---|---|---|
+| `HARBOR_PORT` | API | Local listen port, unrelated to AuthDeep. |
+| `AUTHDEEP_GATEWAY_KEY` | API | `gwk_...` — identifies inbound requests as from the registered `harbor-api` service. |
+| `AUTHDEEP_SERVICE_SECRET` | API | `ssk_...` — verifies `X-Gateway-Signature` on inbound requests. |
+| `AUTHDEEP_BASE_URL` | Worker | Tenant host, e.g. `https://<tenant-slug>.authdeep.com`. Never `https://app.authdeep.com`. |
+| `AUTHDEEP_SERVICE_KEY` | Worker | `sak_...` — sent as `X-API-Key` on every outbound call. |
+| `AUTHDEEP_HMAC_SECRET` | Worker | HMAC secret paired with the `sak_`, signs every outbound call. |
+| `AUTHDEEP_DIGEST_TO` | Worker | Recipient address for the low-stock digest email. |
+
+All placeholders live in [.env.example](.env.example).
+
+## Where the keys go — never in this chat, never committed
+
+1. **Local `.env`** (gitignored — [.gitignore](.gitignore)): fill in real
+   values from `.env.example`'s placeholders.
+2. **Wherever each half runs in production** — for the API that's the
+   Render dashboard's Environment tab (`AUTHDEEP_GATEWAY_KEY` +
+   `AUTHDEEP_SERVICE_SECRET`, already set there as of this integration). For
+   the worker, wherever it's actually invoked from (a scheduled job, a
+   second Render service, a cron host) — set all four worker vars there.
+   Never in the `Dockerfile` or any committed file.
+
+If you have a new secret to hand over, put it directly into one of those two
+places yourself — don't paste it into this chat.
+
+## How the API verifies inbound requests
+
+Unchanged from the original gateway work — see skill §9:
 
 ```
 signed string = METHOD "\n" path "\n" unix_timestamp "\n" sha256hex(raw_body)
 ```
 
-- `path` is the request path only (no query string), trailing slash stripped
-  — this is the path Harbor receives, i.e. already stripped of the
-  `/api/gateway/proxy/harbor-api` prefix by the gateway.
-- `raw_body` is `""` for bodyless requests (its sha256 is the well-known
-  `e3b0c442...` empty-string hash).
-- Expected header: `X-Gateway-Signature: t=<unix_timestamp>,v1=<hex hmac>`,
-  HMAC-SHA256 keyed with `AUTHDEEP_SERVICE_SECRET`.
+- `path`: request path only (no query string), trailing slash stripped —
+  already stripped of the `/api/gateway/proxy/harbor-api` prefix by AuthDeep
+  before it reaches Harbor.
+- `X-Gateway-Signature: t=<unix_timestamp>,v1=<hex hmac>`, HMAC-SHA256 keyed
+  with `AUTHDEEP_SERVICE_SECRET`.
 - `X-Gateway-Key` must equal `AUTHDEEP_GATEWAY_KEY`.
-- Requests older/newer than 300s (clock skew) are rejected.
-- Comparison uses `crypto.timingSafeEqual` (no early-exit string compare).
+- ±300s clock skew tolerance; `crypto.timingSafeEqual` comparison.
+- **Never reads** `X-AuthDeep-User-ID`/`-Email`/`-Roles` to authorize
+  anything — only checks whether `X-AuthDeep-User-ID` is present, and logs a
+  warning if it is, since Path C must never carry one.
 
-On success, the injected identity headers are trusted and attached to
-`request.gateway`:
+## How the worker signs outbound requests
 
-```ts
-{ tenantId, apiKeyId, apiKeyType, userId, userEmail, userRoles, authType, requestId }
+Same construction, mirrored — skill §1:
+
+```
+signed string = METHOD "\n" path+query "\n" unix_timestamp "\n" sha256hex(raw_body)
 ```
 
-(from `X-AuthDeep-Tenant-ID`, `X-AuthDeep-API-Key-ID`, `X-AuthDeep-API-Key-Type`,
-`X-AuthDeep-User-ID`, `X-AuthDeep-User-Email`, `X-AuthDeep-User-Roles`,
-`X-AuthDeep-Auth-Type`, `X-Gateway-Request-Id`). Nothing currently reads
-`request.gateway` — it's there for whoever adds tenant-aware logic or
-audit logging next, so route handlers don't have to re-parse headers.
+`signedFetch` in `harborClient.ts` builds this for every AuthDeep call,
+sending `X-API-Key: <AUTHDEEP_SERVICE_KEY>` and
+`X-HMAC-Signature: t=...,v1=...`. It's shared by both `fetchProducts()`
+(path `/api/gateway/proxy/harbor-api/products`) and `mailer.ts`'s send
+(path `/api/gateway/notifications/email`) — same `sak_`, same signing, only
+the path and body differ.
 
 ## Verifying the integration
 
 Three tiers, cheapest/safest first. Re-run **Tier 0 after every redeploy or
-env var change** — it's what caught a real bug during this integration (see
-below), takes seconds, and needs no secrets.
+env var change**.
 
-### Tier 0 — is the deployed API wired correctly? (no secrets needed)
-
-These only need the API's own base URL and the already-known
-`X-Harbor-Key`/`gwk_` values (neither is sensitive enough to withhold from
-this check — the `ssk_` never appears here). Run against the live deployment:
+### Tier 0 — API config sanity (no secrets needed)
 
 ```bash
 HARBOR_URL=https://harbor-6jd6.onrender.com
-HARBOR_KEY=<your X-Harbor-Key>
 GWK=gwk_7d1f876385a4e9e44aa7b1a817428c6fb6703b693a388f5120ea4c5efe000442
 
-echo "1) health, unauthenticated"
-curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/health"                 # expect 200
-
-echo "2) no auth at all"
-curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/products"               # expect 401
-
-echo "3) legacy X-Harbor-Key still works (worker path)"
-curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/products" \
-  -H "X-Harbor-Key: $HARBOR_KEY"                                              # expect 200
-
-echo "4) bogus gateway signature alone"
-curl -s "$HARBOR_URL/products" \
-  -H "X-Gateway-Key: gwk_bogus" -H "X-Gateway-Signature: t=1,v1=deadbeef"
-# expect 401 {"error":"unauthorized"} -> both env vars ARE set on Render
-# 500 {"error":"gateway not configured"} -> AUTHDEEP_GATEWAY_KEY and/or
-#   AUTHDEEP_SERVICE_SECRET is missing on Render; set it and redeploy
-
-echo "5) real gwk_, bad signature -> confirms the gwk_ match check runs, not just presence"
-curl -s "$HARBOR_URL/products" \
-  -H "X-Gateway-Key: $GWK" -H "X-Gateway-Signature: t=1,v1=deadbeef"          # expect 401
+echo "1) health, unauthenticated";               curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/health"                 # expect 200
+echo "2) no auth at all";                          curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/products"               # expect 401
+echo "3) old X-Harbor-Key (must now fail — deleted, PLAN.md Phase 2 acceptance)"
+curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/products" -H "X-Harbor-Key: whatever-it-used-to-be"                        # expect 401
+echo "4) bogus gateway signature";                 curl -s "$HARBOR_URL/products" -H "X-Gateway-Key: gwk_bogus" -H "X-Gateway-Signature: t=1,v1=deadbeef"
+# expect 401 {"error":"unauthorized"} -> both API env vars ARE set
+# 500 {"error":"gateway not configured"} -> one is missing on Render; set it and redeploy
+echo "5) real gwk_, bad signature";                curl -s "$HARBOR_URL/products" -H "X-Gateway-Key: $GWK" -H "X-Gateway-Signature: t=1,v1=deadbeef"   # expect 401
 ```
 
-**Last run against this deployment (2026-09-14):** check 4 first came back
-`500 gateway not configured` — `AUTHDEEP_GATEWAY_KEY` had not been set on
-Render (only `AUTHDEEP_SERVICE_SECRET` had). After adding it and redeploying,
-all five checks passed as expected above. If you see `500` here, that's the
-fix: add the missing env var on Render and redeploy, then re-run this tier.
+**Last run against this deployment (2026-09-14):** all five passed —
+`AUTHDEEP_GATEWAY_KEY` and `AUTHDEEP_SERVICE_SECRET` are both set on Render,
+and the old key is confirmed gone (check 3 now returns `401`, where it used
+to return `200` before Phase 2).
 
-### Tier 1 — does Harbor accept a *genuinely* correct signature?
+### Tier 1 — does the API accept a *genuinely* correct signature?
 
-Tier 0 only proves bad signatures are rejected — it doesn't prove a real one
-is accepted, since it never uses the real `ssk_`. Run this **locally**, with
-your real secret only in your own shell environment (never pasted into this
-chat, never echoed):
+Run locally with your real `ssk_` typed into the shell, never pasted here:
 
 ```bash
 HARBOR_URL=https://harbor-6jd6.onrender.com
 GWK=gwk_7d1f876385a4e9e44aa7b1a817428c6fb6703b693a388f5120ea4c5efe000442
-read -s -p "ssk_: " SSK; echo   # typed value isn't echoed to the terminal
+read -s -p "ssk_: " SSK; echo
 
 SIG=$(node -e "
 const crypto = require('crypto');
@@ -168,81 +163,98 @@ const sig = crypto.createHmac('sha256', process.env.SSK).update(payload).digest(
 console.log('t=' + ts + ',v1=' + sig);
 " SSK="$SSK")
 
-curl -s -w "\nHTTP %{http_code}\n" "$HARBOR_URL/products" \
-  -H "X-Gateway-Key: $GWK" \
-  -H "X-Gateway-Signature: $SIG"
+curl -s -w "\nHTTP %{http_code}\n" "$HARBOR_URL/products" -H "X-Gateway-Key: $GWK" -H "X-Gateway-Signature: $SIG"
 # expect 200 and the seeded product list
 ```
 
-`200` here proves Harbor's verification logic (path/timestamp/body-hash
-construction, HMAC key) matches what AuthDeep will actually send — the exact
-thing that was validated locally with a throwaway test secret during
-development (see git history of this file for that run: correctly-signed
-`GET`/`POST` → `200`, tampered signature / no auth → `401`, legacy key
-unaffected).
+Validated during development with a throwaway test secret (not the real
+`ssk_`): correctly-signed `GET`/`POST` → `200`; tampered signature / no
+auth → `401`; old `X-Harbor-Key` → `401` (confirms it's truly gone, not
+just untested); a valid signature carrying a forged `X-AuthDeep-User-ID`
+still authenticates (identity headers aren't part of the signature) but
+logs `"gateway request authenticated — unexpected User-ID header present"`
+— proving the required log line fires and the warning path works.
 
 ### Tier 2 — true end-to-end, through AuthDeep itself
 
-Tier 0 and 1 only prove Harbor's side. This proves the whole chain,
-including AuthDeep's own signing — needs a minted `sak_` (see "Still to do"
-below):
+The real test for the **worker** specifically — once `AUTHDEEP_BASE_URL`,
+`AUTHDEEP_SERVICE_KEY`, `AUTHDEEP_HMAC_SECRET`, `AUTHDEEP_DIGEST_TO` are set
+wherever the worker runs:
 
 ```bash
-AUTHDEEP_BASE=<your-authdeep-tenant-host>   # e.g. https://<tenant-slug>.authdeep.com
-SAK=sak_...
-HMAC_SECRET=...   # returned alongside the sak_ when it was minted
-
-# build X-HMAC-Signature per the skill's §1 outbound recipe:
-# METHOD\n<path+query>\n<unix_timestamp>\nsha256hex(body), keyed with HMAC_SECRET
-curl -s -w "\nHTTP %{http_code}\n" \
-  "$AUTHDEEP_BASE/api/gateway/proxy/harbor-api/products" \
-  -H "X-API-Key: $SAK" \
-  -H "X-HMAC-Signature: t=...,v1=..."
-# expect 200 and the same product list Tier 1 returned
+npm run digest -- --dry-run   # prints the exact email payload, no send, no AuthDeep call for the send step
+npm run digest                # real run: reads products through the proxy, sends via AuthDeep, expect "digest sent"
 ```
 
-If Tier 1 passes but Tier 2 doesn't, the bug is on the AuthDeep side (service
-registration, `sak_` permissions, or the outbound signature) — Harbor itself
-is already proven correct by Tier 1. Cross-check `X-Gateway-Request-Id` from
-the response/error against Render's logs to see exactly what Harbor received
-for that request.
+For the API in isolation, the equivalent is any real caller hitting
+`<authdeep-base>/api/gateway/proxy/harbor-api/products` with a `sak_` +
+HMAC per the skill's §1 outbound recipe — expect `200` with the product
+list.
+
+**Validated this session** against a local mock of AuthDeep's contract (a
+plain HTTP server that independently recomputes and checks the same
+HMAC AuthDeep would, using test `sak_test`/`hmac_test_secret`, on the
+`/api/gateway/proxy/harbor-api/products` and
+`/api/gateway/notifications/email` routes) — this exercises the *real*
+`harborClient.ts`/`mailer.ts`/`run.ts` code, only substituting the mock for
+AuthDeep itself:
+
+| Case | Result |
+|---|---|
+| `npm run digest -- --dry-run` | Printed the correct payload (`GADGET-2`, `BOLT-9`, not `WIDGET-1`); mock received **zero** requests to the notifications route |
+| `npm run digest` | `digest sent`; mock verified the HMAC on both the products read and the notification send, payload matched dry-run's |
+| `AUTHDEEP_BASE_URL` pointed at a closed port | `fetch failed`, exit `1` |
+| `AUTHDEEP_DIGEST_TO` unset | `AUTHDEEP_DIGEST_TO must be set`, exit `1`, before any network call |
+
+This proves the worker's signing math, payload shape, and error handling
+are all correct independent of AuthDeep's own behavior. It does **not**
+prove AuthDeep's admin-side config (service registration, `sak_`
+permissions, tenant SMTP) is correct — only a real Tier 2 run against the
+actual tenant proves that.
 
 ## Still to do (in AuthDeep, not this repo)
 
-1. **Confirm the registered service config** in AuthDeep admin matches
-   reality: `backendUrl = https://harbor-6jd6.onrender.com`,
-   `healthPath = /health`. Tier 0 check 1 only proves Harbor's `/health` is
-   reachable directly — it doesn't prove AuthDeep's service record points at
-   it. Only Tier 2 (or the AuthDeep admin UI) confirms that.
-2. ~~**Set `AUTHDEEP_GATEWAY_KEY` and `AUTHDEEP_SERVICE_SECRET`** on Render~~
-   — done as of 2026-09-14 (see Tier 0 note above).
-3. **Mint a `sak_` for callers** (recipe D, step 3):
+1. **Confirm the registered service config**: `backendUrl =
+   https://harbor-6jd6.onrender.com`, `healthPath = /health`.
+2. **Mint the `sak_`** with both permissions (PLAN.md Phase 2):
+   ```json
+   { "permissions": [
+     { "serviceId": "<harbor-api service id>", "httpMethod": "*" },
+     { "capability": "notifications_email", "httpMethod": "POST" }
+   ] }
    ```
-   POST /api/gateway/api-keys/service
-   { "permissions": [{ "serviceId": "<harbor-api service id>", "httpMethod": "*" }] }
-   ```
-   Hand the resulting `sak_` + HMAC secret to whatever service will call
-   Harbor through the gateway.
-4. **Callers use**:
-   ```
-   POST <authdeep-base>/api/gateway/proxy/harbor-api/products/WIDGET-1/adjust
-   X-API-Key: sak_...
-   X-HMAC-Signature: t=...,v1=...
-   ```
-   signed per the skill's §1 outbound HMAC recipe — not the same signature
-   as the inbound one Harbor verifies; the gateway re-signs on the way in.
+   Store the resulting `sak_` + HMAC secret as `AUTHDEEP_SERVICE_KEY` /
+   `AUTHDEEP_HMAC_SECRET` wherever the worker runs.
+3. **Configure tenant notification delivery** (`provider: smtp` + real SMTP
+   fields, or `authdeep_mail`) via `PUT /api/gateway/notifications/settings`
+   — without it, sends may `202` but never actually deliver. PLAN.md prefers
+   real SMTP so Phase 2 mail is real, not just accepted.
+4. **Decide where the worker actually runs** and set its four env vars
+   there (a scheduled job, a second Render service, wherever `npm run
+   digest` gets invoked on a schedule) — it isn't deployed anywhere yet,
+   it's still a CLI you run by hand.
 
-## Troubleshooting a `401` from the gateway path
+## Troubleshooting
 
-- **Wrong/missing env var** — `AUTHDEEP_GATEWAY_KEY`/`AUTHDEEP_SERVICE_SECRET`
-  not set on Render, or don't match what AuthDeep issued for `harbor-api`.
-- **Clock skew** — Render host clock or AuthDeep's clock more than 5 minutes
-  off; usually transient, retry.
-- **Path mismatch** — signature computed over a path AuthDeep didn't
-  actually forward (e.g. including the `/api/gateway/proxy/harbor-api`
-  prefix, or a trailing slash Harbor stripped). Check `request.url` in
-  Harbor's logs against what was signed.
-- **Body mismatch** — anything that touches the body between AuthDeep
-  signing it and Harbor receiving it (a proxy, a body-parsing library that
-  reformats JSON) breaks the hash. Harbor hashes the exact raw bytes it
-  received.
+**API side, `401` from the gateway path:**
+- Wrong/missing `AUTHDEEP_GATEWAY_KEY`/`AUTHDEEP_SERVICE_SECRET` on Render.
+- Clock skew >5 minutes between Render and AuthDeep.
+- Path mismatch — signature computed over a path Harbor didn't actually
+  receive (check `request.url` in Render logs against what was signed).
+- Body mismatch — anything reformatting the JSON between signing and
+  receipt breaks the hash; Harbor hashes the exact raw bytes it gets.
+
+**Worker side:**
+- `AUTHDEEP_BASE_URL, AUTHDEEP_SERVICE_KEY and AUTHDEEP_HMAC_SECRET must all
+  be set` — one of the three is missing; only matters for a real send,
+  `--dry-run` doesn't need them.
+- `AUTHDEEP_DIGEST_TO must be set` — no recipient configured; also checked
+  before `--dry-run`'s print, so dry-run needs this one even though it
+  skips the network call.
+- `fetch failed` — `AUTHDEEP_BASE_URL` unreachable or wrong.
+- `GET /products failed: 403 ...` / `notification send failed: 403 ...` —
+  the `sak_` is missing the relevant permission (service `harbor-api` /
+  `notifications_email` capability) — see "Still to do" item 2.
+- `notification send failed: 202` never happens by definition, but a `202`
+  with `accepted: false`, or delivery that never arrives despite `202`, most
+  likely means tenant SMTP isn't configured — see "Still to do" item 3.

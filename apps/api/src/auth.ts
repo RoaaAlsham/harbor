@@ -1,7 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { FastifyReply, FastifyRequest } from "fastify";
 
-const HARBOR_API_KEY = process.env.HARBOR_API_KEY ?? "";
 const GATEWAY_KEY = process.env.AUTHDEEP_GATEWAY_KEY ?? "";
 const GATEWAY_SECRET = process.env.AUTHDEEP_SERVICE_SECRET ?? "";
 const CLOCK_SKEW_SECS = 300;
@@ -10,9 +9,6 @@ export interface GatewayIdentity {
   tenantId?: string;
   apiKeyId?: string;
   apiKeyType?: string;
-  userId?: string;
-  userEmail?: string;
-  userRoles?: string;
   authType?: string;
   requestId?: string;
 }
@@ -30,11 +26,13 @@ function headerString(request: FastifyRequest, name: string): string | undefined
 }
 
 /**
- * Verifies AuthDeep gateway proxy requests (docs §9): the gateway signs
- * every hop with the service's ssk_ so the backend can trust the identity
- * headers it injects instead of the caller's own headers.
+ * Path C only (gateway-integration skill §6/§9): the AuthDeep gateway is the
+ * sole caller Harbor trusts, proxying sak_/cak_-authenticated requests and
+ * signing each hop with ssk_. Path C never carries a human identity, so
+ * User-ID/Email/Roles are never read for authorization here — only their
+ * presence is logged, since that would indicate a misconfigured gateway.
  */
-function verifyGatewaySignature(
+export function requireGatewaySignature(
   request: FastifyRequest,
   reply: FastifyReply,
   done: (err?: Error) => void
@@ -70,39 +68,24 @@ function verifyGatewaySignature(
     return;
   }
 
+  const authType = headerString(request, "x-authdeep-auth-type");
+  const apiKeyType = headerString(request, "x-authdeep-api-key-type");
+  const userIdPresent = Boolean(headerString(request, "x-authdeep-user-id"));
+
   request.gateway = {
     tenantId: headerString(request, "x-authdeep-tenant-id"),
     apiKeyId: headerString(request, "x-authdeep-api-key-id"),
-    apiKeyType: headerString(request, "x-authdeep-api-key-type"),
-    userId: headerString(request, "x-authdeep-user-id"),
-    userEmail: headerString(request, "x-authdeep-user-email"),
-    userRoles: headerString(request, "x-authdeep-user-roles"),
-    authType: headerString(request, "x-authdeep-auth-type"),
+    apiKeyType,
+    authType,
     requestId: headerString(request, "x-gateway-request-id"),
   };
 
-  done();
-}
+  request.log.info(
+    { auth_type: authType, api_key_type: apiKeyType, user_id_present: userIdPresent },
+    userIdPresent
+      ? "gateway request authenticated — unexpected User-ID header present"
+      : "gateway request authenticated"
+  );
 
-/**
- * Accepts either an AuthDeep gateway-signed request (identified by the
- * presence of X-Gateway-Key) or a direct caller presenting X-Harbor-Key —
- * the worker and manual testing still use the latter.
- */
-export function requireApiKey(
-  request: FastifyRequest,
-  reply: FastifyReply,
-  done: (err?: Error) => void
-) {
-  if (headerString(request, "x-gateway-key")) {
-    verifyGatewaySignature(request, reply, done);
-    return;
-  }
-
-  const key = request.headers["x-harbor-key"];
-  if (!key || key !== HARBOR_API_KEY) {
-    reply.code(401).send({ error: "unauthorized" });
-    return;
-  }
   done();
 }

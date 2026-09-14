@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { db } from "./db.js";
-import { requireApiKey } from "./auth.js";
+import { requireGatewaySignature } from "./auth.js";
 
 interface Product {
   id: number;
@@ -20,7 +20,7 @@ const adjustStmt = db.prepare<[number, string, string], void>(
 export function registerProductRoutes(app: FastifyInstance) {
   // preHandler, not onRequest: gateway signature verification needs the
   // parsed request body (see rawBody capture in index.ts).
-  app.addHook("preHandler", requireApiKey);
+  app.addHook("preHandler", requireGatewaySignature);
 
   app.get("/products", async () => {
     return { products: listStmt.all() };

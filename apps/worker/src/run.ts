@@ -1,8 +1,9 @@
 import { fetchProducts } from "./harborClient.js";
 import { findLowStock } from "./digest.js";
-import { writeDigestEmail } from "./mailer.js";
+import { sendDigestEmail } from "./mailer.js";
 
 async function main() {
+  const dryRun = process.argv.includes("--dry-run");
   const products = await fetchProducts();
   const lowStock = findLowStock(products);
 
@@ -11,8 +12,8 @@ async function main() {
     return;
   }
 
-  const filePath = writeDigestEmail(lowStock);
-  console.log(filePath);
+  await sendDigestEmail(lowStock, { dryRun });
+  console.log(dryRun ? "dry run — not sent" : "digest sent");
 }
 
 main().catch((err) => {

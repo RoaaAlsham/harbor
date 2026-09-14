@@ -1,15 +1,17 @@
 # Harbor
 
 Harbor is an internal ops tool: an HTTP API of products/stock, plus a CLI
-worker that finds low-stock items and writes an email digest.
+worker that finds low-stock items and emails a digest.
 
-- **API** — Fastify + SQLite (`better-sqlite3`), key-based auth via
-  `X-Harbor-Key`.
-- **Worker** — a Node CLI that calls the API, filters low-stock products,
-  and writes an HTML email file to an outbox directory (no SMTP required).
+- **API** — Fastify + SQLite (`better-sqlite3`). Every route except
+  `/health` is reachable only through an AuthDeep API gateway, which signs
+  each proxied request; the API verifies that signature.
+- **Worker** — a Node CLI that reads products and sends the digest, both via
+  AuthDeep (`sak_` + HMAC) — no direct calls to the API, no SMTP config.
 
 There is no browser app and no user login — Harbor is a machine-to-machine
-tool.
+tool, and AuthDeep never forwards a human identity to it (Path C: API-key
+callers only, see [AUTHDEEP_INTEGRATION.md](AUTHDEEP_INTEGRATION.md)).
 
 ## Install
 
@@ -19,7 +21,9 @@ npm install
 
 ## Configure
 
-Copy the example env file and adjust if needed:
+Copy the example env file and fill in the real values (see
+[AUTHDEEP_INTEGRATION.md](AUTHDEEP_INTEGRATION.md) for where each one comes
+from and where to store it):
 
 ```bash
 cp .env.example .env
@@ -27,8 +31,16 @@ cp .env.example .env
 
 ```
 HARBOR_PORT=8788
-HARBOR_API_KEY=dev-harbor-key-change-me
-HARBOR_API_URL=http://127.0.0.1:8788
+
+# API — verifies inbound AuthDeep gateway signatures
+AUTHDEEP_GATEWAY_KEY=
+AUTHDEEP_SERVICE_SECRET=
+
+# Worker — calls AuthDeep for product reads and digest email
+AUTHDEEP_BASE_URL=
+AUTHDEEP_SERVICE_KEY=
+AUTHDEEP_HMAC_SECRET=
+AUTHDEEP_DIGEST_TO=
 ```
 
 ## Seed the database
@@ -54,45 +66,46 @@ npm run seed
 npm run dev:api
 ```
 
-Listens on `http://127.0.0.1:8788`. Every route except `/health` requires
-the `X-Harbor-Key` header; missing or wrong keys get `401`.
-
-```bash
-curl -s http://127.0.0.1:8788/products -H "X-Harbor-Key: dev-harbor-key-change-me"
-```
+Listens on `http://127.0.0.1:8788`. Every route except `/health` requires a
+valid AuthDeep gateway signature (`X-Gateway-Key` + `X-Gateway-Signature`);
+missing or invalid ones get `401`, and an unconfigured gateway gets `500`.
+There is no standalone API key you can curl with directly — see
+[AUTHDEEP_INTEGRATION.md](AUTHDEEP_INTEGRATION.md) for signed-request
+examples (local test signature, and the real gateway proxy path).
 
 ### Routes
 
 | Method | Path | Body | Result |
 |--------|------|------|--------|
-| GET | `/health` | — | `{ ok: true }` (no key needed) |
+| GET | `/health` | — | `{ ok: true }` (no auth needed) |
 | GET | `/products` | — | `{ products: [...] }` |
 | GET | `/products/:sku` | — | product or `404` |
 | POST | `/products/:sku/adjust` | `{ "delta": number }` | updated product (quantity clamped at 0) |
 
 ## Run the digest worker
 
-With the API running:
-
 ```bash
 npm run digest
 ```
 
-- If nothing is low on stock, it prints `no low stock` and exits `0`
-  without writing a file.
-- If something is low, it writes
-  `apps/worker/data/outbox/digest-<ISO-timestamp>.html`, prints the file
-  path, and exits `0`. Open the file in a browser to read the digest.
-- If the API is unreachable, it exits `1` with an error on stderr.
+1. Reads products through the AuthDeep gateway proxy.
+2. Keeps rows where `quantity <= reorder_at`.
+3. If none: prints `no low stock`, exits `0`.
+4. If some: sends the digest via `POST /api/gateway/notifications/email`
+   (AuthDeep), to `AUTHDEEP_DIGEST_TO`. Prints `digest sent` on success
+   (`202`), exits `0`.
+5. Add `--dry-run` to build and print the exact email payload without
+   sending it — still reads real product data, just skips the send.
+6. Network/API/AuthDeep failure: exits `1`, message on stderr.
 
-`apps/worker/src/harborClient.ts` is the only module that knows the API
-URL and key.
+`apps/worker/src/harborClient.ts` is the only module that knows the AuthDeep
+base URL and service key; it exports a shared `signedFetch` that both
+product reads and `mailer.ts`'s email send use.
 
 ## AuthDeep gateway
 
-The API also accepts requests proxied through an AuthDeep API gateway
-(`/api/gateway/proxy/harbor-api/...`), verifying the gateway's signature
-instead of `X-Harbor-Key`. See [AUTHDEEP_INTEGRATION.md](AUTHDEEP_INTEGRATION.md).
+Full integration record — what changed, why, where secrets live, and how to
+verify it's working — is in [AUTHDEEP_INTEGRATION.md](AUTHDEEP_INTEGRATION.md).
 
 ## Project layout
 

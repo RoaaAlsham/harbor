@@ -1,10 +1,7 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import type { Product } from "./harborClient.js";
+import { signedFetch } from "./harborClient.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const outboxDir = join(__dirname, "..", "data", "outbox");
+const DIGEST_TO = process.env.AUTHDEEP_DIGEST_TO ?? "";
 
 function escapeHtml(value: string | number): string {
   return String(value).replace(/[&<>"']/g, (char) => {
@@ -23,14 +20,14 @@ function escapeHtml(value: string | number): string {
   });
 }
 
-export function writeDigestEmail(lowStock: Product[]): string {
-  if (!existsSync(outboxDir)) {
-    mkdirSync(outboxDir, { recursive: true });
-  }
+export interface DigestEmail {
+  to: string;
+  subject: string;
+  html_body: string;
+  text_body: string;
+}
 
-  const now = new Date();
-  const safeTimestamp = now.toISOString().replace(/[:.]/g, "-");
-  const filePath = join(outboxDir, `digest-${safeTimestamp}.html`);
+export function buildDigestEmail(lowStock: Product[]): DigestEmail {
   const subject = `Harbor low-stock digest — ${lowStock.length} item(s)`;
 
   const rows = lowStock
@@ -44,14 +41,7 @@ export function writeDigestEmail(lowStock: Product[]): string {
     )
     .join("\n");
 
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <title>${escapeHtml(subject)}</title>
-</head>
-<body>
-  <h1>${escapeHtml(subject)}</h1>
+  const html_body = `<h1>${escapeHtml(subject)}</h1>
   <table border="1" cellpadding="6" cellspacing="0">
     <thead>
       <tr>
@@ -64,11 +54,43 @@ export function writeDigestEmail(lowStock: Product[]): string {
     <tbody>
 ${rows}
     </tbody>
-  </table>
-</body>
-</html>
-`;
+  </table>`;
 
-  writeFileSync(filePath, html, "utf-8");
-  return filePath;
+  const text_body = [
+    subject,
+    ...lowStock.map((p) => `${p.sku}\t${p.name}\tqty ${p.quantity}\treorder at ${p.reorder_at}`),
+  ].join("\n");
+
+  return { to: DIGEST_TO, subject, html_body, text_body };
+}
+
+/**
+ * Sends the digest via AuthDeep (gateway-integration skill §7c, sak_ + HMAC).
+ * --dry-run builds the exact payload and prints it without ever touching the
+ * network, so it works without AuthDeep credentials configured.
+ */
+export async function sendDigestEmail(
+  lowStock: Product[],
+  options: { dryRun: boolean }
+): Promise<void> {
+  const email = buildDigestEmail(lowStock);
+
+  if (!email.to) {
+    throw new Error("AUTHDEEP_DIGEST_TO must be set");
+  }
+
+  if (options.dryRun) {
+    console.log(JSON.stringify(email, null, 2));
+    return;
+  }
+
+  const response = await signedFetch("POST", "/api/gateway/notifications/email", email);
+  if (response.status !== 202) {
+    throw new Error(`notification send failed: ${response.status} ${response.statusText}`);
+  }
+
+  const body = (await response.json()) as { accepted?: boolean };
+  if (!body.accepted) {
+    throw new Error("notification send not accepted");
+  }
 }
