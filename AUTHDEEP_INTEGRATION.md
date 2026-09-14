@@ -102,33 +102,120 @@ On success, the injected identity headers are trusted and attached to
 `request.gateway` — it's there for whoever adds tenant-aware logic or
 audit logging next, so route handlers don't have to re-parse headers.
 
-## Verified locally
+## Verifying the integration
 
-Ran the API locally with test credentials
-(`AUTHDEEP_GATEWAY_KEY=gwk_test`, `AUTHDEEP_SERVICE_SECRET=ssk_testsecret`)
-and confirmed all four cases:
+Three tiers, cheapest/safest first. Re-run **Tier 0 after every redeploy or
+env var change** — it's what caught a real bug during this integration (see
+below), takes seconds, and needs no secrets.
 
-| Request | Result |
-|---|---|
-| Correctly signed `GET /products` | `200` |
-| Same request, tampered signature | `401` |
-| No auth headers at all | `401` |
-| Legacy `X-Harbor-Key` (worker path) | `200` — unaffected |
-| Correctly signed `POST /products/WIDGET-1/adjust` with a JSON body | `200`, body hash matched |
+### Tier 0 — is the deployed API wired correctly? (no secrets needed)
 
-Reproduce with `node -e` to build the HMAC (see git history of this file's
-commit, or the gateway-integration skill's §1/§9) — or once you have real
-AuthDeep credentials, trigger a real call through the proxy and confirm it
-reaches Harbor with a `200`.
+These only need the API's own base URL and the already-known
+`X-Harbor-Key`/`gwk_` values (neither is sensitive enough to withhold from
+this check — the `ssk_` never appears here). Run against the live deployment:
+
+```bash
+HARBOR_URL=https://harbor-6jd6.onrender.com
+HARBOR_KEY=<your X-Harbor-Key>
+GWK=gwk_7d1f876385a4e9e44aa7b1a817428c6fb6703b693a388f5120ea4c5efe000442
+
+echo "1) health, unauthenticated"
+curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/health"                 # expect 200
+
+echo "2) no auth at all"
+curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/products"               # expect 401
+
+echo "3) legacy X-Harbor-Key still works (worker path)"
+curl -s -o /dev/null -w "%{http_code}\n" "$HARBOR_URL/products" \
+  -H "X-Harbor-Key: $HARBOR_KEY"                                              # expect 200
+
+echo "4) bogus gateway signature alone"
+curl -s "$HARBOR_URL/products" \
+  -H "X-Gateway-Key: gwk_bogus" -H "X-Gateway-Signature: t=1,v1=deadbeef"
+# expect 401 {"error":"unauthorized"} -> both env vars ARE set on Render
+# 500 {"error":"gateway not configured"} -> AUTHDEEP_GATEWAY_KEY and/or
+#   AUTHDEEP_SERVICE_SECRET is missing on Render; set it and redeploy
+
+echo "5) real gwk_, bad signature -> confirms the gwk_ match check runs, not just presence"
+curl -s "$HARBOR_URL/products" \
+  -H "X-Gateway-Key: $GWK" -H "X-Gateway-Signature: t=1,v1=deadbeef"          # expect 401
+```
+
+**Last run against this deployment (2026-09-14):** check 4 first came back
+`500 gateway not configured` — `AUTHDEEP_GATEWAY_KEY` had not been set on
+Render (only `AUTHDEEP_SERVICE_SECRET` had). After adding it and redeploying,
+all five checks passed as expected above. If you see `500` here, that's the
+fix: add the missing env var on Render and redeploy, then re-run this tier.
+
+### Tier 1 — does Harbor accept a *genuinely* correct signature?
+
+Tier 0 only proves bad signatures are rejected — it doesn't prove a real one
+is accepted, since it never uses the real `ssk_`. Run this **locally**, with
+your real secret only in your own shell environment (never pasted into this
+chat, never echoed):
+
+```bash
+HARBOR_URL=https://harbor-6jd6.onrender.com
+GWK=gwk_7d1f876385a4e9e44aa7b1a817428c6fb6703b693a388f5120ea4c5efe000442
+read -s -p "ssk_: " SSK; echo   # typed value isn't echoed to the terminal
+
+SIG=$(node -e "
+const crypto = require('crypto');
+const ts = Math.floor(Date.now()/1000).toString();
+const bodyHash = crypto.createHash('sha256').update('').digest('hex');
+const payload = 'GET\n/products\n' + ts + '\n' + bodyHash;
+const sig = crypto.createHmac('sha256', process.env.SSK).update(payload).digest('hex');
+console.log('t=' + ts + ',v1=' + sig);
+" SSK="$SSK")
+
+curl -s -w "\nHTTP %{http_code}\n" "$HARBOR_URL/products" \
+  -H "X-Gateway-Key: $GWK" \
+  -H "X-Gateway-Signature: $SIG"
+# expect 200 and the seeded product list
+```
+
+`200` here proves Harbor's verification logic (path/timestamp/body-hash
+construction, HMAC key) matches what AuthDeep will actually send — the exact
+thing that was validated locally with a throwaway test secret during
+development (see git history of this file for that run: correctly-signed
+`GET`/`POST` → `200`, tampered signature / no auth → `401`, legacy key
+unaffected).
+
+### Tier 2 — true end-to-end, through AuthDeep itself
+
+Tier 0 and 1 only prove Harbor's side. This proves the whole chain,
+including AuthDeep's own signing — needs a minted `sak_` (see "Still to do"
+below):
+
+```bash
+AUTHDEEP_BASE=<your-authdeep-tenant-host>   # e.g. https://<tenant-slug>.authdeep.com
+SAK=sak_...
+HMAC_SECRET=...   # returned alongside the sak_ when it was minted
+
+# build X-HMAC-Signature per the skill's §1 outbound recipe:
+# METHOD\n<path+query>\n<unix_timestamp>\nsha256hex(body), keyed with HMAC_SECRET
+curl -s -w "\nHTTP %{http_code}\n" \
+  "$AUTHDEEP_BASE/api/gateway/proxy/harbor-api/products" \
+  -H "X-API-Key: $SAK" \
+  -H "X-HMAC-Signature: t=...,v1=..."
+# expect 200 and the same product list Tier 1 returned
+```
+
+If Tier 1 passes but Tier 2 doesn't, the bug is on the AuthDeep side (service
+registration, `sak_` permissions, or the outbound signature) — Harbor itself
+is already proven correct by Tier 1. Cross-check `X-Gateway-Request-Id` from
+the response/error against Render's logs to see exactly what Harbor received
+for that request.
 
 ## Still to do (in AuthDeep, not this repo)
 
-1. **Confirm the registered service config** matches reality: `backendUrl =
-   https://harbor-6jd6.onrender.com`, `healthPath = /health`. If the service
-   was registered before the Render deploy existed, double-check this.
-2. **Set `AUTHDEEP_GATEWAY_KEY` and `AUTHDEEP_SERVICE_SECRET`** in Render's
-   dashboard (see above) and redeploy — without them every gateway-proxied
-   request will 500.
+1. **Confirm the registered service config** in AuthDeep admin matches
+   reality: `backendUrl = https://harbor-6jd6.onrender.com`,
+   `healthPath = /health`. Tier 0 check 1 only proves Harbor's `/health` is
+   reachable directly — it doesn't prove AuthDeep's service record points at
+   it. Only Tier 2 (or the AuthDeep admin UI) confirms that.
+2. ~~**Set `AUTHDEEP_GATEWAY_KEY` and `AUTHDEEP_SERVICE_SECRET`** on Render~~
+   — done as of 2026-09-14 (see Tier 0 note above).
 3. **Mint a `sak_` for callers** (recipe D, step 3):
    ```
    POST /api/gateway/api-keys/service
