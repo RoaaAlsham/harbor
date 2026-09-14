@@ -20,4 +20,4 @@ COPY scripts scripts
 ENV NODE_ENV=production
 EXPOSE 8788
 
-CMD ["npm", "run", "start", "--workspace", "apps/api"]
+ENTRYPOINT ["sh", "-c", "npm run seed && npm run start --workspace apps/api"]
